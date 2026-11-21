@@ -1,0 +1,84 @@
+name: Harbor release inspection
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  inspect:
+    name: Inspect Harbor on Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BASE_URL: http://127.0.0.1:8388
+      EXPECTED_RELEASE: devops6-harbor-42
+      CHECK_TIMEOUT: '3'
+      WEB_CONTAINER: harbor-web
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install locked dependencies
+        id: packages
+        run: |
+          mkdir -p reports
+          python -m pip install -r requirements.txt 2>&1 | tee reports/packages.log
+      - name: Build image and start Nginx
+        run: |
+          docker build -t "harbor-web:$GITHUB_SHA" . 2>&1 | tee reports/build.log
+          docker run -d --name "$WEB_CONTAINER" -p 127.0.0.1:8388:80 "harbor-web:$GITHUB_SHA"
+      - name: Wait for the published port
+        id: warmup
+        run: |
+          timeout 20s curl -fsS --retry 8 --retry-all-errors --retry-delay 1 \
+            --max-time 2 -o /dev/null -w 'Published port: HTTP %{http_code}\n' \
+            "$BASE_URL/" 2>&1 | tee reports/wait.log
+      - name: Inspect container with Testinfra
+        if: ${{ !cancelled() && steps.warmup.outcome == 'success' }}
+        run: |
+          python -m pytest -v tests/infra --hosts="docker://$WEB_CONTAINER" \
+            --junitxml=reports/infra.xml 2>&1 | tee reports/infra.log
+      - name: Verify the external HTTP contract
+        if: ${{ !cancelled() && steps.warmup.outcome == 'success' }}
+        run: |
+          python -m pytest -v tests/http --junitxml=reports/http.xml 2>&1 | tee reports/http.log
+      - name: Test the command in isolation
+        if: ${{ !cancelled() && steps.packages.outcome == 'success' }}
+        run: |
+          python -m pytest -v tests/unit --junitxml=reports/command-tests.xml \
+            2>&1 | tee reports/command-tests.log
+      - name: Run the release verification command
+        if: ${{ !cancelled() && steps.warmup.outcome == 'success' }}
+        run: python verify_web.py 2>&1 | tee reports/release-command.log
+      - name: Готовність підтверджено
+        if: success()
+        run: echo "Container checks, HTTP contract and release command passed."
+      - name: Collect and clean container
+        if: always()
+        run: |
+          mkdir -p reports
+          docker ps -a --filter "name=$WEB_CONTAINER" > reports/container-list.txt
+          if docker inspect "$WEB_CONTAINER" > /dev/null 2>&1; then
+            docker logs "$WEB_CONTAINER" > reports/nginx.log 2>&1 || true
+            docker rm -f "$WEB_CONTAINER" 2>&1 | tee reports/removal.log
+          fi
+      - name: Upload harbor-run-reports
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: harbor-run-reports
+          path: reports/
+          retention-days: 7
